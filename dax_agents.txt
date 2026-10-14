@@ -1,0 +1,240 @@
+from math import isfinite
+from typing import TypedDict
+
+import pandas as pd
+import ta
+import yfinance as yf
+from langgraph.graph import END, StateGraph
+
+
+class MarketData(TypedDict):
+    date: str
+    close: float
+    ema20: float
+    ema50: float
+    rsi: float
+
+
+class MacroData(TypedDict):
+    vix: float
+    risk_mode: str
+
+
+class QuantData(TypedDict):
+    long_score: int
+    short_score: int
+    bias: str
+
+
+class RiskData(TypedDict):
+    allow_trade: bool
+    reason: str
+
+
+class TradingState(TypedDict, total=False):
+    market_data: MarketData
+    macro: MacroData
+    quant: QuantData
+    risk: RiskData
+    report: str
+
+
+def download_close(ticker: str, period: str) -> pd.Series:
+    data = yf.download(
+        ticker,
+        period=period,
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+    )
+
+    if data.empty:
+        raise RuntimeError(f"Yahoo Finance lieferte keine Daten für {ticker}.")
+
+    if isinstance(data.columns, pd.MultiIndex):
+        close_columns = [
+            column for column in data.columns if "Close" in column
+        ]
+        ticker_column = next(
+            (column for column in close_columns if ticker in column),
+            None,
+        )
+
+        if ticker_column is not None:
+            close = data[ticker_column]
+        elif len(close_columns) == 1:
+            close = data[close_columns[0]]
+        else:
+            raise ValueError(f"Keine eindeutige Close-Spalte für {ticker}.")
+    else:
+        if "Close" not in data.columns:
+            raise ValueError(f"Close-Spalte für {ticker} fehlt.")
+        close = data["Close"]
+
+    close = pd.to_numeric(close, errors="coerce").dropna()
+
+    if close.empty:
+        raise RuntimeError(f"Keine gültigen Schlusskurse für {ticker}.")
+
+    return close
+
+
+def load_market_data(state: TradingState) -> dict:
+    close = download_close("^GDAXI", "6mo")
+
+    if len(close) < 50:
+        raise RuntimeError("Zu wenige DAX-Kurse für die Indikatorberechnung.")
+
+    ema20 = ta.trend.ema_indicator(close, window=20)
+    ema50 = ta.trend.ema_indicator(close, window=50)
+    rsi = ta.momentum.rsi(close, window=14)
+
+    latest_values = {
+        "close": float(close.iloc[-1]),
+        "ema20": float(ema20.iloc[-1]),
+        "ema50": float(ema50.iloc[-1]),
+        "rsi": float(rsi.iloc[-1]),
+    }
+
+    if not all(isfinite(value) for value in latest_values.values()):
+        raise RuntimeError("Indikatoren enthalten ungültige Werte.")
+
+    return {
+        "market_data": {
+            "date": close.index[-1].strftime("%Y-%m-%d"),
+            **latest_values,
+        }
+    }
+
+
+def macro_agent(state: TradingState) -> dict:
+    vix_close = download_close("^VIX", "5d")
+    vix = float(vix_close.iloc[-1])
+
+    if not isfinite(vix):
+        raise RuntimeError("Der aktuelle VIX-Wert ist ungültig.")
+
+    if vix < 20:
+        risk_mode = "RISK_ON"
+    elif vix < 30:
+        risk_mode = "CAUTIOUS"
+    else:
+        risk_mode = "RISK_OFF"
+
+    return {"macro": {"vix": vix, "risk_mode": risk_mode}}
+
+
+def quant_agent(state: TradingState) -> dict:
+    data = state.get("market_data")
+    if data is None:
+        raise RuntimeError("Marktdaten fehlen im Graph-Zustand.")
+
+    long_score = 0
+    short_score = 0
+
+    if data["close"] > data["ema20"]:
+        long_score += 30
+    elif data["close"] < data["ema20"]:
+        short_score += 30
+
+    if data["ema20"] > data["ema50"]:
+        long_score += 40
+    elif data["ema20"] < data["ema50"]:
+        short_score += 40
+
+    if 50 <= data["rsi"] < 70:
+        long_score += 30
+    elif 30 < data["rsi"] <= 50:
+        short_score += 30
+
+    if long_score >= 70 and long_score > short_score:
+        bias = "LONG"
+    elif short_score >= 70 and short_score > long_score:
+        bias = "SHORT"
+    else:
+        bias = "NEUTRAL"
+
+    return {
+        "quant": {
+            "long_score": long_score,
+            "short_score": short_score,
+            "bias": bias,
+        }
+    }
+
+
+def risk_agent(state: TradingState) -> dict:
+    quant = state.get("quant")
+    macro = state.get("macro")
+
+    if quant is None or macro is None:
+        raise RuntimeError("Quant- oder Makrodaten fehlen.")
+
+    if quant["bias"] == "NEUTRAL":
+        allow_trade = False
+        reason = "Kein ausreichend starkes Richtungssignal."
+    elif macro["vix"] >= 30:
+        allow_trade = False
+        reason = "VIX ist hoch; Signal wird durch den Risikofilter blockiert."
+    else:
+        allow_trade = True
+        reason = "Signal hat den einfachen VIX-Risikofilter bestanden."
+
+    return {"risk": {"allow_trade": allow_trade, "reason": reason}}
+
+
+def report_agent(state: TradingState) -> dict:
+    market = state.get("market_data")
+    macro = state.get("macro")
+    quant = state.get("quant")
+    risk = state.get("risk")
+
+    if any(item is None for item in (market, macro, quant, risk)):
+        raise RuntimeError("Der Report kann nicht erstellt werden: Daten fehlen.")
+
+    report = f"""DAX DAILY REPORT
+Letzte verfügbare Tageskerze: {market['date']}
+
+DAX: {market['close']:.2f}
+EMA20: {market['ema20']:.2f}
+EMA50: {market['ema50']:.2f}
+RSI: {market['rsi']:.2f}
+
+Long-Score: {quant['long_score']}
+Short-Score: {quant['short_score']}
+Bias: {quant['bias']}
+
+VIX: {macro['vix']:.2f}
+Marktmodus: {macro['risk_mode']}
+
+Handel durch einfachen Filter freigegeben: {risk['allow_trade']}
+Begründung: {risk['reason']}
+
+Hinweis: Das ist ein regelbasiertes Signal, keine geprüfte Strategie
+und keine Positionsgrößen- oder Anlageempfehlung.
+"""
+
+    return {"report": report}
+
+
+builder = StateGraph(TradingState)
+
+builder.add_node("market_data", load_market_data)
+builder.add_node("macro", macro_agent)
+builder.add_node("quant", quant_agent)
+builder.add_node("risk", risk_agent)
+builder.add_node("report", report_agent)
+
+builder.set_entry_point("market_data")
+builder.add_edge("market_data", "macro")
+builder.add_edge("macro", "quant")
+builder.add_edge("quant", "risk")
+builder.add_edge("risk", "report")
+builder.add_edge("report", END)
+
+graph = builder.compile()
+
+
+if __name__ == "__main__":
+    result = graph.invoke({})
+    print(result["report"])

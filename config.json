@@ -1,0 +1,50 @@
+{
+  "ollama": {
+    "active": false,
+    "base_url": "http://192.168.1.9:11434",
+    "model": "qwen3:14b"
+  },
+  "macro_indicators": {
+    "vix": {
+      "active": true,
+      "ticker": "^VIX"
+    },
+    "eur_usd": {
+      "active": true,
+      "ticker": "EURUSD=X"
+    },
+    "us10y": {
+      "active": true,
+      "ticker": "^TNX"
+    },
+    "nasdaq_futures": {
+      "active": true,
+      "ticker": "NQ=F"
+    },
+    "sp500_futures": {
+      "active": true,
+      "ticker": "ES=F"
+    }
+  },
+  "news": {
+    "active": true,
+    "lookback_hours": 24,
+    "max_articles": 10,
+    "gdelt": {
+      "active": true,
+      "query": "Trump (market OR stocks OR tariff OR trade OR sanctions OR oil OR rates OR Fed)"
+    },
+    "rss_feeds": [
+      {
+        "name": "CNBC US Top News",
+        "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+        "active": true
+      },
+      {
+        "name": "MarketWatch Top Stories",
+        "url": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+        "active": true
+      }
+    ]
+  }
+}

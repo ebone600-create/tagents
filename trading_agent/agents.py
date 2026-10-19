@@ -59,20 +59,30 @@ def report_agent(state: TradingState) -> dict[str, str]:
             f"Headline sentiment ({news['sentiment_method']}; informational only): "
             f"{news['overall_sentiment']}"
         ]
-        if news["enabled_sources"]:
+        if news["enabled_sources"] and not news["articles"]:
             news_lines.append(f"Sources: {', '.join(news['enabled_sources'])}")
         if news["articles"]:
-            for article in news["articles"]:
-                topics = ", ".join(article["topics"]) or "market policy"
-                news_lines.append(
-                    f"- [{article['published_at']}] {article['source']}: "
-                    f"{article['title']} "
-                    f"(sentiment: {article['sentiment']}; "
-                    f"potential market impact: {article['market_impact']}; "
-                    f"topics: {topics})"
+            for index, article in enumerate(news["articles"]):
+                source_label = (
+                    f" | Source: {article['source']}"
+                    if article["source"] != article["provider"]
+                    else ""
                 )
-                news_lines.append(f"  Assessment: {article['impact_reason']}")
-                news_lines.append(f"  {article['url']}")
+                topics = ", ".join(article["topics"]) or "market policy"
+                if index:
+                    news_lines.append("")
+                news_lines.extend(
+                    [
+                        f"- [{article['published_at']}] Provider: "
+                        f"{article['provider']}{source_label}",
+                        f"  News: {article['title']}",
+                        f"  Sentiment: {article['sentiment']}",
+                        f"  Potential market impact: {article['market_impact']}",
+                        f"  Topics: {topics}",
+                        f"  Assessment: {article['impact_reason']}",
+                        f"  URL: {article['url']}",
+                    ]
+                )
         else:
             news_lines.append("No recent Trump-related market-impact headlines found.")
         news_lines.append(

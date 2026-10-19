@@ -3,6 +3,7 @@ from email.utils import parsedate_to_datetime
 from html import unescape
 import json
 import re
+import subprocess
 from typing import Literal, cast
 from urllib.parse import urldefrag, urlsplit, urlunsplit
 import xml.etree.ElementTree as ET
@@ -15,6 +16,7 @@ from trading_agent.state import NewsArticle, NewsContext, TradingState
 GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 GDELT_SOURCE = "GDELT"
 USER_AGENT = "trading-agent-news-review/1.0"
+GDELT_STATUS_MARKER = "\n__GDELT_HTTP_STATUS__:"
 
 _IMPACT_TERMS = (
     "tariff",
@@ -184,6 +186,7 @@ def _heuristic_market_impact(
 
 def _make_article(
     *,
+    provider: str,
     source: str,
     title: str,
     description: str,
@@ -209,6 +212,7 @@ def _make_article(
 
     text = f"{clean_title} {clean_description}"
     return {
+        "provider": provider,
         "source": source,
         "title": clean_title,
         "summary": clean_description[:1000],
@@ -241,6 +245,7 @@ def _parse_gdelt(
         if str(raw_article.get("language", "")).casefold() != "english":
             continue
         article = _make_article(
+            provider=GDELT_SOURCE,
             source=str(raw_article.get("domain") or GDELT_SOURCE),
             title=str(raw_article.get("title") or ""),
             description=str(raw_article.get("description") or ""),
@@ -294,6 +299,7 @@ def _parse_rss(
             or ""
         )
         article = _make_article(
+            provider=feed.name,
             source=feed.name,
             title=title,
             description=description,
@@ -307,6 +313,68 @@ def _parse_rss(
     return articles
 
 
+def _request_gdelt(request_params: dict[str, str | int]) -> object:
+    command = [
+        "curl",
+        "--silent",
+        "--show-error",
+        "--get",
+        GDELT_URL,
+    ]
+    for name, value in request_params.items():
+        command.extend(["--data-urlencode", f"{name}={value}"])
+    command.extend(
+        [
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "130",
+            "--retry",
+            "2",
+            "--retry-delay",
+            "10",
+            "--retry-max-time",
+            "300",
+            "--write-out",
+            f"{GDELT_STATUS_MARKER}%{{http_code}}",
+            "--header",
+            f"User-Agent: {USER_AGENT}",
+        ]
+    )
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=400,
+            check=False,
+        )
+    except FileNotFoundError as error:
+        raise requests.RequestException(
+            "GDELT request requires the curl executable, but curl was not found."
+        ) from error
+    except subprocess.TimeoutExpired as error:
+        raise requests.Timeout("GDELT curl request exceeded 400 seconds.") from error
+
+    if result.returncode:
+        detail = result.stderr.strip() or f"curl exited with status {result.returncode}"
+        raise requests.RequestException(f"GDELT curl request failed: {detail}")
+    if GDELT_STATUS_MARKER not in result.stdout:
+        raise ValueError("GDELT curl response did not include an HTTP status code.")
+
+    body, status_text = result.stdout.rsplit(GDELT_STATUS_MARKER, 1)
+    try:
+        status_code = int(status_text.strip())
+    except ValueError as error:
+        raise ValueError(f"Invalid GDELT HTTP status code: {status_text!r}") from error
+    if status_code != 200:
+        raise requests.HTTPError(
+            f"GDELT returned HTTP {status_code}: {body[:500].strip()}"
+        )
+
+    return json.loads(body)
+
+
 def _fetch_gdelt(
     query: str,
     *,
@@ -315,21 +383,17 @@ def _fetch_gdelt(
     cutoff: datetime,
     now: datetime,
 ) -> list[NewsArticle]:
-    response = requests.get(
-        GDELT_URL,
-        params={
+    payload = _request_gdelt(
+        {
             "query": query,
             "mode": "ArtList",
             "format": "json",
-            "maxrecords": min(max_articles * 3, 250),
+            "maxrecords": min(max_articles, 250),
             "sort": "DateDesc",
             "timespan": f"{lookback_hours}h",
-        },
-        headers={"User-Agent": USER_AGENT},
-        timeout=(5, 60),
+        }
     )
-    response.raise_for_status()
-    return _parse_gdelt(response.json(), cutoff=cutoff, now=now)
+    return _parse_gdelt(payload, cutoff=cutoff, now=now)
 
 
 def _fetch_feed(

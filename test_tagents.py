@@ -166,6 +166,89 @@ class ReportAgentTests(unittest.TestCase):
         self.assertIn("not a validated", result["report"])
         self.assertNotIn("Trade allowed:", result["report"])
 
+    def test_report_formats_news_and_avoids_repeating_rss_provider_as_source(self) -> None:
+        result = report_agent(
+            {
+                "market_data": {
+                    "symbol": "^GDAXI",
+                    "date": "2026-10-15",
+                    "open": 159.0,
+                    "close": 160.0,
+                    "ema20": 155.0,
+                    "ema50": 150.0,
+                    "ema200": 145.0,
+                    "rsi": 60.0,
+                    "atr14": 2.0,
+                    "gap_pct": 0.5,
+                },
+                "macro_context": {
+                    "indicators": {},
+                    "errors": {},
+                    "enabled_indicators": [],
+                    "risk_mode": "UNAVAILABLE",
+                },
+                "quant": {"long_score": 100, "short_score": 0, "bias": "LONG"},
+                "risk": {"review_candidate": True, "reason": "Manual review required."},
+                "news_context": {
+                    "active": True,
+                    "articles": [
+                        {
+                            "provider": "CNBC US Top News",
+                            "source": "CNBC US Top News",
+                            "title": "Trump tariff news moves markets",
+                            "summary": "",
+                            "url": "https://cnbc.com/story",
+                            "published_at": "2026-10-15T19:43+00:00",
+                            "sentiment": "NEGATIVE",
+                            "sentiment_source": "keyword heuristic",
+                            "market_impact": "RISK_OFF",
+                            "impact_reason": "Tariff uncertainty may increase market risk.",
+                            "topics": ["trade_policy"],
+                        },
+                        {
+                            "provider": "GDELT",
+                            "source": "example.com",
+                            "title": "Trump market headline from GDELT",
+                            "summary": "",
+                            "url": "https://example.com/story",
+                            "published_at": "2026-10-15T18:43+00:00",
+                            "sentiment": "UNCLEAR",
+                            "sentiment_source": "keyword heuristic",
+                            "market_impact": "UNCLEAR",
+                            "impact_reason": "No clear market impact.",
+                            "topics": [],
+                        },
+                    ],
+                    "errors": {},
+                    "enabled_sources": ["GDELT", "CNBC US Top News"],
+                    "sentiment_method": "keyword heuristic",
+                    "overall_sentiment": "MIXED",
+                },
+            }
+        )["report"]
+
+        self.assertIn(
+            "- [2026-10-15T19:43+00:00] Provider: CNBC US Top News\n"
+            "  News: Trump tariff news moves markets\n"
+            "  Sentiment: NEGATIVE\n"
+            "  Potential market impact: RISK_OFF\n"
+            "  Topics: trade_policy\n"
+            "  Assessment: Tariff uncertainty may increase market risk.\n"
+            "  URL: https://cnbc.com/story",
+            result,
+        )
+        self.assertIn(
+            "- [2026-10-15T18:43+00:00] Provider: GDELT | Source: example.com\n"
+            "  News: Trump market headline from GDELT\n"
+            "  Sentiment: UNCLEAR\n"
+            "  Potential market impact: UNCLEAR\n"
+            "  Topics: market policy\n"
+            "  Assessment: No clear market impact.\n"
+            "  URL: https://example.com/story",
+            result,
+        )
+        self.assertNotIn("Sources: GDELT, CNBC US Top News", result)
+
 
 class GraphIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -321,17 +404,72 @@ class GraphIntegrationTests(unittest.TestCase):
 
         with patch.object(market_data, "download_ohlc", side_effect=self._download):
             baseline = graph.build_graph("^ATX", baseline_config).invoke({})
-            with patch.object(news.requests, "get", return_value=response):
+            with patch.object(
+                news,
+                "_request_gdelt",
+                return_value=response.json.return_value,
+            ):
                 result = graph.build_graph("^ATX", config).invoke({})
 
         self.assertEqual(result["quant"], baseline["quant"])
         self.assertEqual(result["risk"], baseline["risk"])
         self.assertIn("Trump-related news context", result["report"])
         self.assertIn("Headline sentiment (keyword heuristic; informational only): POSITIVE", result["report"])
+        self.assertIn("Provider: GDELT | Source: example.com", result["report"])
         self.assertIn("not used in quant or risk signal", result["report"])
 
 
 class NewsAgentTests(unittest.TestCase):
+    def test_gdelt_uses_curl_with_encoded_parameters_and_bounded_retries(self) -> None:
+        payload = {"articles": []}
+        result = unittest.mock.Mock(
+            returncode=0,
+            stdout=f"{json.dumps(payload)}{news.GDELT_STATUS_MARKER}200",
+            stderr="",
+        )
+        params = {
+            "query": "Trump (market OR stocks)",
+            "mode": "ArtList",
+            "format": "json",
+            "maxrecords": 10,
+            "sort": "DateDesc",
+            "timespan": "24h",
+        }
+
+        with patch.object(news.subprocess, "run", return_value=result) as run:
+            response = news._request_gdelt(params)
+
+        self.assertEqual(response, payload)
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "curl")
+        self.assertIn("query=Trump (market OR stocks)", command)
+        self.assertIn("--connect-timeout", command)
+        self.assertEqual(command[command.index("--connect-timeout") + 1], "10")
+        self.assertEqual(command[command.index("--max-time") + 1], "130")
+        self.assertEqual(command[command.index("--retry") + 1], "2")
+        self.assertEqual(command[command.index("--retry-delay") + 1], "10")
+        self.assertEqual(run.call_args.kwargs["timeout"], 400)
+
+    def test_gdelt_curl_http_errors_are_reported(self) -> None:
+        result = unittest.mock.Mock(
+            returncode=0,
+            stdout=f"rate limited{news.GDELT_STATUS_MARKER}429",
+            stderr="",
+        )
+
+        with patch.object(news.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(news.requests.HTTPError, "HTTP 429: rate limited"):
+                news._request_gdelt({"query": "Trump"})
+
+    def test_gdelt_curl_timeouts_are_reported(self) -> None:
+        with patch.object(
+            news.subprocess,
+            "run",
+            side_effect=news.subprocess.TimeoutExpired("curl", 400),
+        ):
+            with self.assertRaisesRegex(news.requests.Timeout, "exceeded 400 seconds"):
+                news._request_gdelt({"query": "Trump"})
+
     def test_news_agent_combines_recent_gdelt_and_rss_headlines(self) -> None:
         now = datetime.now(UTC).replace(microsecond=0)
         recent = now.strftime("%Y%m%dT%H%M%SZ")
@@ -392,14 +530,25 @@ class NewsAgentTests(unittest.TestCase):
             ),
         )
 
-        with patch.object(
-            news.requests,
-            "get",
-            side_effect=[gdelt_response, rss_response],
-        ) as get:
+        with (
+            patch.object(
+                news,
+                "_request_gdelt",
+                return_value=gdelt_response.json.return_value,
+            ) as gdelt_request,
+            patch.object(news.requests, "get", return_value=rss_response) as get,
+        ):
             context = news.news_context_agent({}, settings=settings)["news_context"]
 
         self.assertEqual(len(context["articles"]), 2)
+        self.assertEqual(
+            {article["provider"] for article in context["articles"]},
+            {"GDELT", "Test RSS"},
+        )
+        gdelt_article = next(
+            article for article in context["articles"] if article["provider"] == "GDELT"
+        )
+        self.assertEqual(gdelt_article["source"], "example.com")
         self.assertEqual(context["overall_sentiment"], "MIXED")
         self.assertEqual(
             {article["sentiment"] for article in context["articles"]},
@@ -415,12 +564,9 @@ class NewsAgentTests(unittest.TestCase):
             },
             {"keyword heuristic"},
         )
-        self.assertEqual(get.call_count, 2)
-        self.assertEqual(
-            get.call_args_list[0].kwargs["params"]["timespan"],
-            "24h",
-        )
-        self.assertEqual(get.call_args_list[0].kwargs["timeout"], (5, 60))
+        gdelt_request.assert_called_once()
+        self.assertEqual(gdelt_request.call_args.args[0]["timespan"], "24h")
+        self.assertEqual(get.call_count, 1)
 
     def test_news_errors_are_retained_in_context(self) -> None:
         settings = config_module.NewsConfig(
@@ -432,8 +578,8 @@ class NewsAgentTests(unittest.TestCase):
             rss_feeds=(),
         )
         with patch.object(
-            news.requests,
-            "get",
+            news,
+            "_request_gdelt",
             side_effect=agents.requests.HTTPError("429 rate limit"),
         ):
             context = news.news_context_agent({}, settings=settings)["news_context"]
@@ -444,6 +590,7 @@ class NewsAgentTests(unittest.TestCase):
     def test_ollama_classifies_market_impact_as_structured_json(self) -> None:
         now = datetime.now(UTC)
         article = news._make_article(
+            provider="Test RSS",
             source="Test",
             title="Trump considers military action after deadly airport strike",
             description="Oil markets react to geopolitical risks.",

@@ -33,6 +33,7 @@ class RiskData(TypedDict):
 
 
 class NewsArticle(TypedDict):
+    provider: str
     source: str
     title: str
     summary: str

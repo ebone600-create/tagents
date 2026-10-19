@@ -18,7 +18,8 @@ orders or calculate an executable position size.
   `ollama.active` is true. If Ollama is disabled or its classification response
   is invalid, a transparent keyword heuristic is used and the problem is
   reported. Each story shows both its tone and a cautious potential market-impact
-  assessment. News does not change the quant bias or risk decision.
+  assessment, along with its news provider and source. News does not change the
+  quant bias or risk decision.
 - Fetches the independent data branches in parallel through LangGraph.
 - Calculates EMA20, EMA50, EMA200, RSI14, ATR14, and the daily opening gap.
 - Loads two years of daily OHLC data to provide sufficient history for EMA200.
@@ -65,12 +66,13 @@ python -m unittest discover -v
 - `dax_agents.py`: selects the primary symbol and starts the generic agent.
 
 Yahoo Finance and the news feeds are used for this prototype and are not
-guaranteed production data sources. GDELT limits request frequency; the agent
-makes one GDELT request per run and reports provider errors instead of hiding
-them. Check each publisher's current feed terms before using its content beyond
-private research. The keyword fallback is not a validated sentiment model. Ollama's market-impact
-assessment is also contextual analysis, not a price forecast or investment
-advice. The news branch uses the configured Ollama model only when
+guaranteed production data sources. GDELT limits request frequency; its request
+uses the system `curl` executable with bounded retries for transient failures.
+Install `curl` on the machine running the agent. Provider errors are reported
+instead of hidden. Check each publisher's current feed terms before using its
+content beyond private research. The keyword fallback is not a validated
+sentiment model. Ollama's market-impact assessment is also contextual analysis,
+not a price forecast or investment advice. The news branch uses the configured Ollama model only when
 `ollama.active` is true; the same switch controls the separate report summary.
 
 ## Optional Ollama summary
